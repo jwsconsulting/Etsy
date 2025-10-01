@@ -2,6 +2,7 @@
 
 import requests
 import json
+import os
 from datetime import datetime, timedelta
 import pyodbc
 
@@ -9,29 +10,124 @@ import pyodbc
 # CONFIGURATION SECTION - Update these values with your information
 # ============================================================================
 
-# Etsy API Credentials
-API_KEY = "your_api_key_here"              # Your Etsy API key (keystring)
-SHOP_ID = "your_shop_id_here"              # Your Etsy shop ID
-ACCESS_TOKEN = "your_access_token_here"    # Your OAuth access token
+# Etsy App Credentials (from developer portal)
+CLIENT_ID = "your_client_id_here"       # Found in your Etsy app
+CLIENT_SECRET = "your_client_secret_here"
+REDIRECT_URI = "http://localhost:8000/callback"  # must match what you registered
+SCOPES = "transactions_r shops_r"       # Adjust if you need more
+
+SHOP_ID = "your_shop_id_here"
+
+# Token storage (local JSON file)
+TOKENS_FILE = "etsy_tokens.json"
 
 # Data Retrieval Settings
-DAYS_BACK = 30                             # Number of days to retrieve sales data
+DAYS_BACK = 30
 
 # SQL Server Database Settings
-SQL_SERVER = "your_server_name"            # SQL Server instance name (e.g., 'localhost' or 'SERVER\INSTANCE')
-SQL_DATABASE = "etsy"                      # Database name
-SQL_ORDERS_TABLE = "etsy_orders"           # Table for order-level data (receipts)
-SQL_ITEMS_TABLE = "etsy_orders_items"      # Table for line item data (transactions)
-USE_WINDOWS_AUTH = True                    # Set to True to use Windows Authentication
+SQL_SERVER = "your_server_name"
+SQL_DATABASE = "etsy"
+SQL_ORDERS_TABLE = "etsy_orders"
+SQL_ITEMS_TABLE = "etsy_orders_items"
+USE_WINDOWS_AUTH = True
 
-# Export Settings (optional - for backup/debugging)
-EXPORT_CSV = False                         # Set to True to also export CSV
-CSV_ORDERS_FILENAME = "etsy_orders.csv"    # Name of the orders CSV output file
-CSV_ITEMS_FILENAME = "etsy_items.csv"      # Name of the items CSV output file
+# Export Settings
+EXPORT_CSV = False
+CSV_ORDERS_FILENAME = "etsy_orders.csv"
+CSV_ITEMS_FILENAME = "etsy_items.csv"
 
 # ============================================================================
 # END CONFIGURATION SECTION
 # ============================================================================
+
+
+# ---------------------------------------------------------------------------
+# OAUTH 2.0 HELPER FUNCTIONS
+# ---------------------------------------------------------------------------
+
+def load_tokens():
+    """Load access/refresh tokens from file if available."""
+    if os.path.exists(TOKENS_FILE):
+        with open(TOKENS_FILE, "r") as f:
+            return json.load(f)
+    return {}
+
+
+def save_tokens(tokens):
+    """Save tokens to disk."""
+    with open(TOKENS_FILE, "w") as f:
+        json.dump(tokens, f, indent=2)
+
+
+def get_authorization_url():
+    """Generate the Etsy OAuth2 authorization URL."""
+    return (
+        f"https://www.etsy.com/oauth/connect"
+        f"?response_type=code"
+        f"&redirect_uri={REDIRECT_URI}"
+        f"&scope={SCOPES}"
+        f"&client_id={CLIENT_ID}"
+    )
+
+
+def exchange_code_for_tokens(auth_code):
+    """Exchange authorization code for access and refresh tokens."""
+    token_url = "https://openapi.etsy.com/v3/public/oauth/token"
+    resp = requests.post(token_url, data={
+        "grant_type": "authorization_code",
+        "client_id": CLIENT_ID,
+        "redirect_uri": REDIRECT_URI,
+        "code": auth_code,
+    }, auth=(CLIENT_ID, CLIENT_SECRET))
+    resp.raise_for_status()
+    tokens = resp.json()
+    save_tokens(tokens)
+    return tokens
+
+
+def refresh_access_token(refresh_token):
+    """Use refresh_token to get a new access_token."""
+    token_url = "https://openapi.etsy.com/v3/public/oauth/token"
+    resp = requests.post(token_url, data={
+        "grant_type": "refresh_token",
+        "client_id": CLIENT_ID,
+        "refresh_token": refresh_token,
+    }, auth=(CLIENT_ID, CLIENT_SECRET))
+    resp.raise_for_status()
+    tokens = resp.json()
+    save_tokens(tokens)
+    return tokens
+
+
+def get_valid_access_token():
+    """
+    Return a valid access token. If expired, refresh it.
+    If no tokens exist, guide the user through the OAuth process.
+    """
+    tokens = load_tokens()
+
+    if not tokens:
+        print("No tokens found. First-time setup required.")
+        print("1. Visit this URL and authorize the app:")
+        print(get_authorization_url())
+        auth_code = input("2. Paste the 'code' parameter from the redirected URL here: ")
+        tokens = exchange_code_for_tokens(auth_code)
+
+    # Check expiry
+    expires_at = tokens.get("expires_at")
+    if not expires_at:
+        # calculate expiry timestamp from now + expires_in
+        expires_in = tokens.get("expires_in", 3600)
+        tokens["expires_at"] = datetime.now().timestamp() + expires_in
+        save_tokens(tokens)
+
+    if datetime.now().timestamp() >= tokens["expires_at"]:
+        print("Access token expired. Refreshing...")
+        tokens = refresh_access_token(tokens["refresh_token"])
+        tokens["expires_at"] = datetime.now().timestamp() + tokens.get("expires_in", 3600)
+        save_tokens(tokens)
+
+    return tokens["access_token"]
 
 
 class EtsySalesRetriever:
@@ -445,20 +541,26 @@ class EtsySalesRetriever:
         print(f"Line items exported to {items_filename}")
 
 
-# Example usage
+# ---------------------------------------------------------------------------
+# MAIN SCRIPT
+# ---------------------------------------------------------------------------
+
 if __name__ == "__main__":
-    # Initialize the retriever with config values
-    retriever = EtsySalesRetriever(API_KEY, SHOP_ID, ACCESS_TOKEN)
-    
-    # Get sales data with line items using configured days back
+    # Step 1: Ensure we have a valid token
+    access_token = get_valid_access_token()
+
+    # Step 2: Initialize retriever
+    retriever = EtsySalesRetriever(CLIENT_ID, SHOP_ID, access_token)
+
+    # Step 3: Run data retrieval
     receipts_data, transactions_data = retriever.get_all_sales_with_items(days_back=DAYS_BACK)
-    
+
     print(f"\n{'='*60}")
     print(f"Total orders retrieved: {len(receipts_data)}")
     print(f"Total line items retrieved: {len(transactions_data)}")
     print(f"{'='*60}\n")
-    
-    # Upsert to SQL Server
+
+    # Step 4: Insert into SQL Server
     retriever.upsert_to_sql_server(
         receipts_data,
         transactions_data,
@@ -468,8 +570,8 @@ if __name__ == "__main__":
         items_table=SQL_ITEMS_TABLE,
         use_windows_auth=USE_WINDOWS_AUTH
     )
-    
-    # Optional: Export to CSV for backup or debugging
+
+    # Step 5: Optional CSV export
     if EXPORT_CSV:
         retriever.export_to_csv(
             receipts_data,
